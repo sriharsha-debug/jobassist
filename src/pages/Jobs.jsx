@@ -1,12 +1,37 @@
 import React, { useEffect, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 
+function buildPrompt({ baseResumeText, jobDescription, jobTitle, company }) {
+  return `You are a resume-tailoring assistant. You will be given a candidate's base resume and a target job description.
+
+Rewrite the resume so it is tailored to this specific job, following these rules:
+1. Do NOT invent new jobs, skills, degrees, or achievements that are not present in the base resume.
+2. You MAY reorder sections/bullets, rephrase wording, and emphasize experience that matches the job description's requirements.
+3. Mirror relevant keywords and terminology from the job description where the candidate genuinely has that experience.
+4. Keep it truthful, concise, and in standard resume formatting (plain text with clear section headers).
+5. Output ONLY the tailored resume text - no preamble, no explanation, no markdown code fences.
+
+Target role: ${jobTitle} at ${company}
+
+Job description:
+"""
+${jobDescription}
+"""
+
+Candidate's base resume:
+"""
+${baseResumeText}
+"""`;
+}
+
 export default function Jobs({ session }) {
   const [jobs, setJobs] = useState([]);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
-  const [tailoring, setTailoring] = useState(null);
   const [results, setResults] = useState({});
+  const [pasteOpenFor, setPasteOpenFor] = useState(null);
+  const [pasteText, setPasteText] = useState("");
+  const [saving, setSaving] = useState(false);
 
   async function loadJobs(q) {
     let request = supabase.from("jobs").select("*").order("posted_at", { ascending: false });
@@ -18,21 +43,86 @@ export default function Jobs({ session }) {
 
   useEffect(() => {
     loadJobs();
-  }, []);
+    if (session) {
+      supabase
+        .from("applications")
+        .select("*")
+        .eq("user_id", session.user.id)
+        .then(({ data }) => {
+          if (data) {
+            const byJob = {};
+            data.forEach((a) => (byJob[a.job_id] = a));
+            setResults(byJob);
+          }
+        });
+    }
+  }, [session]);
 
-  async function handleTailor(job) {
+  async function handleOpenTailor(job) {
     if (!session) {
       setError("Please log in and fill out your profile (with a base resume) first.");
       return;
     }
     setError("");
-    setTailoring(job.id);
-    const { data, error } = await supabase.functions.invoke("tailor-resume", {
-      body: { jobId: job.id },
+
+    const { data: profile, error: profileErr } = await supabase
+      .from("profiles")
+      .select("base_resume_text")
+      .eq("id", session.user.id)
+      .single();
+
+    if (profileErr || !profile?.base_resume_text) {
+      setError("Save a base resume in your Profile page first.");
+      return;
+    }
+
+    const prompt = buildPrompt({
+      baseResumeText: profile.base_resume_text,
+      jobDescription: job.description,
+      jobTitle: job.title,
+      company: job.company,
     });
+
+    try {
+      await navigator.clipboard.writeText(prompt);
+    } catch {
+      // clipboard may fail in some browsers/contexts; user can still select text manually
+    }
+
+    window.open("https://claude.ai/new", "_blank", "noopener,noreferrer");
+    setPasteOpenFor(job.id);
+    setPasteText("");
+  }
+
+  async function handleSavePasted(job) {
+    if (!pasteText.trim()) {
+      setError("Paste the AI's tailored resume text before saving.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+
+    const { data, error } = await supabase
+      .from("applications")
+      .upsert(
+        {
+          user_id: session.user.id,
+          job_id: job.id,
+          tailored_resume_text: pasteText,
+          status: "draft",
+        },
+        { onConflict: "user_id,job_id" }
+      )
+      .select()
+      .single();
+
+    setSaving(false);
     if (error) setError(error.message);
-    else setResults((prev) => ({ ...prev, [job.id]: data }));
-    setTailoring(null);
+    else {
+      setResults((prev) => ({ ...prev, [job.id]: data }));
+      setPasteOpenFor(null);
+      setPasteText("");
+    }
   }
 
   async function handleApply(application) {
@@ -80,19 +170,45 @@ export default function Jobs({ session }) {
             </div>
             <p>{job.description.slice(0, 220)}{job.description.length > 220 ? "..." : ""}</p>
 
-            <button onClick={() => handleTailor(job)} disabled={tailoring === job.id}>
-              {tailoring === job.id ? "Tailoring resume..." : "Auto-tailor my resume"}
+            <button onClick={() => handleOpenTailor(job)}>
+              Tailor resume with Claude.ai
             </button>
 
-            {application && (
+            {pasteOpenFor === job.id && (
+              <div style={{ marginTop: 12 }}>
+                <p style={{ fontSize: 13, color: "#666" }}>
+                  A prompt was copied to your clipboard and Claude.ai opened in a new tab. Paste the
+                  prompt there (Ctrl+V), copy Claude's reply, then paste it below and save.
+                </p>
+                <textarea
+                  value={pasteText}
+                  onChange={(e) => setPasteText(e.target.value)}
+                  placeholder="Paste Claude's tailored resume here..."
+                  style={{ minHeight: 180 }}
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button onClick={() => handleSavePasted(job)} disabled={saving}>
+                    {saving ? "Saving..." : "Save tailored resume"}
+                  </button>
+                  <button onClick={() => setPasteOpenFor(null)} disabled={saving}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {application && pasteOpenFor !== job.id && (
               <div style={{ marginTop: 16 }}>
                 <h4>Tailored resume for this job</h4>
                 <pre className="resume">{application.tailored_resume_text}</pre>
-                {application.status !== "applied" ? (
-                  <button onClick={() => handleApply(application)}>Mark as applied</button>
-                ) : (
-                  <span style={{ color: "#16a34a", fontWeight: 600 }}>Applied ✓</span>
-                )}
+                <div style={{ display: "flex", gap: 8 }}>
+                  {application.status !== "applied" ? (
+                    <button onClick={() => handleApply(application)}>Mark as applied</button>
+                  ) : (
+                    <span style={{ color: "#16a34a", fontWeight: 600 }}>Applied ✓</span>
+                  )}
+                  <button onClick={() => handleOpenTailor(job)}>Re-tailor</button>
+                </div>
               </div>
             )}
           </div>
